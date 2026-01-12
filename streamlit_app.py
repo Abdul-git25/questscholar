@@ -72,8 +72,8 @@ def check_environment():
     issues = []
     
     # Check for .env file
-    #if not os.path.exists('env'):
-        #issues.append("⚠️ 'env' file not found. Please create it with GOOGLE_API_KEY and ENTREZ_EMAIL")
+    if not os.path.exists('env'):
+        issues.append("⚠️ 'env' file not found. Please create it with GOOGLE_API_KEY and ENTREZ_EMAIL") 
     
     # Check for tools file
     if not os.path.exists('my_tools.py'):
@@ -93,12 +93,25 @@ def check_environment():
 
 def load_environment():
     """Load environment variables"""
-    from dotenv import load_dotenv
+    try:
+        # Try Streamlit secrets first (for cloud deployment)
+        if hasattr(st, 'secrets') and 'GOOGLE_API_KEY' in st.secrets:
+            os.environ['GOOGLE_API_KEY'] = st.secrets['GOOGLE_API_KEY']
+            os.environ['ENTREZ_EMAIL'] = st.secrets.get('ENTREZ_EMAIL', 'default@example.com')
+            return True
+    except Exception:
+        pass
     
-    env_path = os.path.join(os.getcwd(), 'env')
-    if os.path.exists(env_path):
-        load_dotenv(dotenv_path=env_path, override=True)
-        return True
+    # Fall back to local .env file
+    try:
+        from dotenv import load_dotenv
+        env_path = os.path.join(os.getcwd(), 'env')
+        if os.path.exists(env_path):
+            load_dotenv(dotenv_path=env_path, override=True)
+            return True
+    except Exception:
+        pass
+    
     return False
 
 def initialize_tools():
@@ -268,15 +281,32 @@ async def run_workflow(subject, start_year, end_year, source_limits, progress_ba
     from google.adk.runners import InMemoryRunner
     from google.genai import types
     import my_tools
+    import sys
+    from io import StringIO
     
     # Clear previous data
     importlib.reload(my_tools)
     my_tools.clear_papers()
     
     # Load environment
+    status_text.text("🔑 Loading credentials...")
     if not load_environment():
-        st.error("Failed to load environment variables")
-        return None
+        return {
+            'response': None,
+            'error': "Failed to load environment variables. Check your 'env' file.",
+            'statistics': {},
+            'logs': []
+        }
+    
+    # Verify API key
+    api_key = os.getenv('GOOGLE_API_KEY')
+    if not api_key:
+        return {
+            'response': None,
+            'error': "GOOGLE_API_KEY not found in environment",
+            'statistics': {},
+            'logs': []
+        }
     
     # Retry configuration
     retry_config = types.HttpRetryOptions(
@@ -308,39 +338,47 @@ async def run_workflow(subject, start_year, end_year, source_limits, progress_ba
     )
     
     # Execute workflow
-    status_text.text("🚀 Executing research workflow...")
+    status_text.text("🚀 Phase 1: Searching databases...")
     progress_bar.progress(10)
     
     runner = InMemoryRunner(agent=root_agent)
     response = None
     error = None
+    captured_logs = []
     
     try:
-        # Capture logs
-        class StreamlitLogger:
-            def __init__(self, log_container):
-                self.log_container = log_container
-                self.logs = []
-            
-            def write(self, text):
-                if text.strip():
-                    self.logs.append(text.strip())
-                    with self.log_container:
-                        st.text(text.strip())
+        # Capture output
+        log_capture = StringIO()
         
-        import sys
-        old_stdout = sys.stdout
-        logger = StreamlitLogger(log_container)
+        # Track progress through phases
+        phase_updates = {
+            10: "Phase 1: Searching 4 databases...",
+            30: "Phase 2: Deduplicating results...",
+            50: "Phase 3: Critic evaluation...",
+            70: "Phase 4: Generating reports..."
+        }
+        
+        async def run_with_progress():
+            nonlocal response
+            response = await runner.run_debug(prompt, verbose=True)
         
         # Run workflow
-        response = await runner.run_debug(prompt, verbose=True)
+        await run_with_progress()
         
-        sys.stdout = old_stdout
+        # Update progress incrementally
+        for prog, msg in phase_updates.items():
+            if prog <= 70:
+                status_text.text(f"✓ {msg}")
+                progress_bar.progress(prog)
+        
         progress_bar.progress(90)
         
+    except ExceptionGroup as eg:
+        error = f"Multiple errors occurred:\n"
+        for i, e in enumerate(eg.exceptions, 1):
+            error += f"\n{i}. {type(e).__name__}: {str(e)}"
     except Exception as e:
-        error = e
-        sys.stdout = old_stdout
+        error = f"{type(e).__name__}: {str(e)}"
     
     # Get statistics
     status_text.text("📊 Calculating statistics...")
@@ -371,7 +409,11 @@ async def run_workflow(subject, start_year, end_year, source_limits, progress_ba
         'response': response,
         'error': error,
         'statistics': stats,
-        'logs': logger.logs if 'logger' in locals() else []
+        'logs': captured_logs,
+        'files_generated': {
+            'pdf': os.path.exists('executive_summary.pdf'),
+            'html': os.path.exists('executive_summary.html')
+        }
     }
 
 # Header
@@ -434,50 +476,145 @@ if run_button and not st.session_state.workflow_running:
         log_container = st.container()
     
     # Run workflow
-    results = asyncio.run(
-        run_workflow(subject, start_year, end_year, source_limits, progress_bar, status_text, log_container)
-    )
-    
-    st.session_state.results = results
-    st.session_state.statistics = results['statistics']
-    st.session_state.workflow_running = False
-    
-    # Clean up progress indicators
-    progress_bar.empty()
-    status_text.empty()
+    try:
+        results = asyncio.run(
+            run_workflow(subject, start_year, end_year, source_limits, progress_bar, status_text, log_container)
+        )
+        
+        # Store results
+        if results:
+            st.session_state.results = results
+            st.session_state.statistics = results.get('statistics', {})
+        else:
+            st.session_state.results = {
+                'error': 'Workflow returned no results',
+                'response': None,
+                'statistics': {},
+                'logs': [],
+                'files_generated': {'pdf': False, 'html': False}
+            }
+            st.session_state.statistics = {}
+    except Exception as e:
+        st.session_state.results = {
+            'error': str(e),
+            'response': None,
+            'statistics': {},
+            'logs': [],
+            'files_generated': {'pdf': False, 'html': False}
+        }
+        st.session_state.statistics = {}
+    finally:
+        st.session_state.workflow_running = False
+        # Clean up progress indicators
+        progress_bar.empty()
+        status_text.empty()
+        # Force rerun to display results
+        st.rerun()
 
 # Display results
 if st.session_state.results:
     results = st.session_state.results
     
-    if results['error']:
-        st.markdown('<div class="error-box">❌ <b>Workflow Error</b><br>' + str(results['error']) + '</div>', unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="success-box">✅ <b>Research Complete!</b></div>', unsafe_allow_html=True)
+    if results.get('error'):
+        st.error(f"**Workflow Error**\n\n{results['error']}")
         
-        # Statistics
+        with st.expander("🔧 Troubleshooting Tips"):
+            st.markdown("""
+            **Common solutions:**
+            
+            1. **Environment Variables Issue:**
+               - For Streamlit Cloud: Add secrets in dashboard (Settings → Secrets)
+               - For local: Create `env` file in project root
+               
+            2. **Streamlit Cloud Setup:**
+               ```toml
+               # In Streamlit Cloud secrets
+               GOOGLE_API_KEY = "your_key_here"
+               ENTREZ_EMAIL = "your_email@example.com"
+               ```
+            
+            3. **Local Setup:**
+               ```bash
+               # Create env file
+               echo 'GOOGLE_API_KEY=your_key_here' > env
+               echo 'ENTREZ_EMAIL=your@email.com' >> env
+               ```
+            
+            4. **Verify your API key:**
+               - Visit [Google AI Studio](https://makersuite.google.com/app/apikey)
+               - Ensure key starts with `AIza`
+               - Check quota limits
+            
+            5. **Other checks:**
+               - [ ] Internet connectivity
+               - [ ] All dependencies installed: `pip install -r requirements_streamlit.txt`
+               - [ ] my_tools.py is present
+               - [ ] Python 3.8 or higher
+            """)
+    else:
+        st.success("✅ **Research Complete!**")
+        
+        # Statistics Dashboard
         st.subheader("📊 Collection Statistics")
         stats = results['statistics']
         
+        # Main metrics
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("Papers Collected", stats['total_collected'])
+            st.metric("Papers Collected", stats['total_collected'], 
+                     help="Total papers found across all sources")
         with col2:
-            st.metric("Evaluated", stats['total_evaluated'])
+            st.metric("Evaluated", stats['total_evaluated'],
+                     help="Papers that passed initial screening")
         with col3:
-            st.metric("High-Rated (≥4.0)", stats['high_rated'])
+            st.metric("High-Rated (≥4.0)", stats['high_rated'],
+                     help="Papers with excellent quality scores")
         with col4:
-            st.metric("Excluded", stats['excluded'])
+            st.metric("Excluded", stats['excluded'],
+                     help="Papers filtered out by critic")
         
+        # Quality scores
         if stats['total_evaluated'] > 0:
             st.subheader("📈 Average Quality Scores")
+            
             col1, col2, col3 = st.columns(3)
             with col1:
-                st.metric("Relevance", f"{stats['avg_relevance']:.2f}/5.0")
+                score = stats['avg_relevance']
+                st.metric("Relevance", f"{score:.2f}/5.0")
+                st.progress(score / 5.0)
             with col2:
-                st.metric("Methodology", f"{stats['avg_methodology']:.2f}/5.0")
+                score = stats['avg_methodology']
+                st.metric("Methodology", f"{score:.2f}/5.0")
+                st.progress(score / 5.0)
             with col3:
-                st.metric("Impact", f"{stats['avg_impact']:.2f}/5.0")
+                score = stats['avg_impact']
+                st.metric("Impact", f"{score:.2f}/5.0")
+                st.progress(score / 5.0)
+            
+            # Quality interpretation
+            avg_overall = (stats['avg_relevance'] + stats['avg_methodology'] + stats['avg_impact']) / 3
+            
+            if avg_overall >= 4.0:
+                quality_msg = "🌟 **Exceptional** - High-quality, relevant research collection"
+                quality_color = "success"
+            elif avg_overall >= 3.5:
+                quality_msg = "✅ **Good** - Solid research foundation"
+                quality_color = "info"
+            elif avg_overall >= 3.0:
+                quality_msg = "⚠️ **Moderate** - Consider refining search criteria"
+                quality_color = "warning"
+            else:
+                quality_msg = "❌ **Low** - Try different keywords or date range"
+                quality_color = "error"
+            
+            if quality_color == "success":
+                st.success(quality_msg)
+            elif quality_color == "info":
+                st.info(quality_msg)
+            elif quality_color == "warning":
+                st.warning(quality_msg)
+            else:
+                st.error(quality_msg)
         
         # Download reports
         st.subheader("📥 Download Reports")
@@ -485,28 +622,170 @@ if st.session_state.results:
         col1, col2 = st.columns(2)
         
         with col1:
-            if os.path.exists('executive_summary.pdf'):
+            if results.get('files_generated', {}).get('pdf'):
                 with open('executive_summary.pdf', 'rb') as f:
                     st.download_button(
                         label="📄 Download PDF Report",
                         data=f,
                         file_name=f"QuestScholar_{subject.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.pdf",
-                        mime="application/pdf"
+                        mime="application/pdf",
+                        help="Professional PDF report for printing and citation"
                     )
+                    st.caption("✓ PDF generated successfully")
             else:
-                st.warning("PDF report not generated")
+                st.warning("⚠️ PDF report not available")
         
         with col2:
-            if os.path.exists('executive_summary.html'):
+            if results.get('files_generated', {}).get('html'):
                 with open('executive_summary.html', 'r', encoding='utf-8') as f:
                     st.download_button(
                         label="🌐 Download HTML Report",
                         data=f,
                         file_name=f"QuestScholar_{subject.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.html",
-                        mime="text/html"
+                        mime="text/html",
+                        help="Interactive HTML with download links and citations"
                     )
+                    st.caption("✓ HTML generated successfully")
             else:
-                st.warning("HTML report not generated")
+                st.warning("⚠️ HTML report not available")
+        
+        # Report features
+        with st.expander("📋 Report Features"):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("""
+                **PDF Report:**
+                - 📄 Professional formatting
+                - 🎨 Custom branding
+                - 📊 Critic evaluations
+                - 🔢 Citation counts
+                - ⭐ Quality rankings
+                """)
+            with col2:
+                st.markdown("""
+                **HTML Report:**
+                - 🔗 Clickable links
+                - ⬇️ Download buttons (arXiv)
+                - 📋 Copy citations
+                - 📱 Responsive design
+                - 🎯 Interactive navigation
+                """)
+        
+        # Raw data access
+        with st.expander("🔬 Advanced: View Raw Data"):
+            st.json({
+                'subject': subject,
+                'date_range': f"{start_year}-{end_year}",
+                'statistics': stats,
+                'timestamp': datetime.now().isoformat()
+            })
+
+else:
+    # Welcome screen
+    st.info("""
+    👋 **Welcome to QuestScholar!**
+    
+    This AI-powered research tool helps you:
+    - 🔍 Search multiple academic databases simultaneously
+    - 🎯 Evaluate papers using AI critic agents
+    - 📊 Generate comprehensive research reports
+    - 📥 Export results in PDF and HTML formats
+    
+    **Getting Started:**
+    1. Configure your research parameters in the sidebar
+    2. Click "🚀 Start Research" to begin
+    3. Wait for the analysis to complete (2-5 minutes)
+    4. Download your reports
+    
+    **Pro Tips:**
+    - Start with 5-10 papers per source for faster results
+    - Use specific keywords for better relevance
+    - Recent years (2020+) have better coverage
+    """)
+    
+    # Setup instructions based on environment
+    with st.expander("⚙️ First Time Setup"):
+        tab1, tab2 = st.tabs(["Streamlit Cloud", "Local Installation"])
+        
+        with tab1:
+            st.markdown("""
+            ### Streamlit Cloud Setup
+            
+            **Step 1: Add Secrets**
+            1. Go to your app settings (☰ menu → Settings)
+            2. Click on "Secrets" in the left sidebar
+            3. Add the following:
+            
+            ```toml
+            GOOGLE_API_KEY = "your_google_api_key_here"
+            ENTREZ_EMAIL = "your_email@example.com"
+            ```
+            
+            **Step 2: Get Google API Key**
+            1. Visit [Google AI Studio](https://makersuite.google.com/app/apikey)
+            2. Click "Create API Key"
+            3. Copy the key (starts with `AIza`)
+            4. Paste into Streamlit secrets
+            
+            **Step 3: Save and Reboot**
+            - Click "Save" in secrets editor
+            - Reboot the app
+            - Done! 🎉
+            """)
+        
+        with tab2:
+            st.markdown("""
+            ### Local Installation Setup
+            
+            **Step 1: Create Environment File**
+            ```bash
+            # Create env file (no extension!)
+            cat > env << EOF
+            GOOGLE_API_KEY=your_google_api_key_here
+            ENTREZ_EMAIL=your_email@example.com
+            EOF
+            ```
+            
+            **Step 2: Install Dependencies**
+            ```bash
+            pip install -r requirements_streamlit.txt
+            ```
+            
+            **Step 3: Run the App**
+            ```bash
+            streamlit run streamlit_app.py
+            ```
+            
+            **Quick Launcher (Alternative):**
+            ```bash
+            # Linux/Mac
+            chmod +x run_questscholar.sh
+            ./run_questscholar.sh
+            
+            # Windows
+            run_questscholar.bat
+            ```
+            """)
+    
+    # Quick examples
+    with st.expander("💡 Example Research Topics"):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("""
+            **Medical Research:**
+            - Langerhans Cell Histiocytosis
+            - CRISPR gene therapy
+            - mRNA vaccine efficacy
+            - Cancer immunotherapy
+            """)
+        with col2:
+            st.markdown("""
+            **Technology:**
+            - Quantum computing applications
+            - Large language models
+            - Neural network architectures
+            - Cybersecurity frameworks
+            """)
 
 # Footer
 st.sidebar.markdown("---")
